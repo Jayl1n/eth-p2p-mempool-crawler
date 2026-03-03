@@ -265,6 +265,7 @@ async fn main() -> Result<()> {
         network_handle.clone(),
         peers.clone(),
         block_sender.clone(),
+        head().number,
     );
     info!("Block poller spawned!");
 

@@ -2,7 +2,7 @@ use crate::types::{PeerInfo, PeerUpdateData, UiUpdate};
 use alloy_primitives::{B256, Sealable};
 use anyhow::Result;
 use dashmap::DashMap;
-use reth_chainspec::ChainSpec;
+use reth_chainspec::{ChainSpec, EthChainSpec};
 use reth_eth_wire::{
 GetBlockBodies, GetBlockHeaders, GetPooledTransactions,
     NewPooledTransactionHashes, PooledTransactions, UnifiedStatus,
@@ -14,6 +14,7 @@ use reth_network::{NetworkHandle, PeerRequest};
 use reth_network_api::{
     NetworkEvent, PeerId,
     events::{PeerEvent, SessionInfo},
+    Peers,
 };
 use reth_primitives::{Block, Head, TransactionSigned};
 use reth_tasks::TaskExecutor;
@@ -62,7 +63,25 @@ impl EthP2PHandler {
 
     fn on_session_established(&self, session_info: Arc<SessionInfo>) {
         let peer_id = session_info.peer_id;
-        info!(target: "crawler::network", %peer_id, client=%session_info.client_version, "Session established...");
+        let status = session_info.status.as_ref();
+        let expected_chain = self.chain_spec.chain;
+        let expected_genesis = self.chain_spec.genesis_hash();
+
+        if status.chain != expected_chain || status.genesis != expected_genesis {
+            warn!(
+                target: "crawler::network",
+                %peer_id,
+                peer_chain = %status.chain,
+                expected_chain = %expected_chain,
+                peer_genesis = %status.genesis,
+                expected_genesis = %expected_genesis,
+                "Rejecting non-BSC peer"
+            );
+            self.network_handle.disconnect_peer(peer_id);
+            return;
+        }
+
+        info!(target: "crawler::network", %peer_id, client=%session_info.client_version, chain=%status.chain, genesis=%status.genesis, "Session established and validated");
 
         let peer_info_struct = PeerSessionInfo {
             status: session_info.status.clone(),
@@ -189,12 +208,13 @@ pub fn spawn_block_poller(
     network_handle: NetworkHandle,
     peers: Arc<DashMap<PeerId, PeerSessionInfo>>,
     block_sender: UnboundedSender<Block>,
+    start_block_number: u64,
 ) {
     let poller_task = async move {
         println!("[INFO] crawler::block-poller: Starting P2P block poller task...");
         let mut interval = tokio::time::interval(Duration::from_secs(5));
 
-        let mut last_seen_block_number: u64 = 23_290_350;
+        let mut last_seen_block_number: u64 = start_block_number;
 
         loop {
             interval.tick().await;
