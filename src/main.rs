@@ -1,7 +1,7 @@
 mod analysis;
 mod api;
+mod bsc;
 mod config;
-mod db;
 mod network;
 mod oracle;
 mod types;
@@ -9,7 +9,8 @@ mod ui;
 
 use crate::{
     api::{ApiTransaction, AppState, create_router},
-    config::{load_config, load_or_generate_key, parse_bootnodes, setup_logging},
+    bsc::{bsc_chain_spec, boot_nodes, head, BscHandshake},
+    config::{load_config, load_or_generate_key, setup_logging},
     network::{EthP2PHandler, spawn_block_poller},
     oracle::GasOracle,
     types::UiUpdate,
@@ -18,10 +19,10 @@ use crate::{
 use dashmap::DashMap;
 use anyhow::Result;
 use futures_util::StreamExt;
-use reth::chainspec::{ChainSpec, MAINNET};
-use reth::network::transactions::NetworkTransactionEvent;
-use reth::revm::revm::primitives::alloy_primitives::{B256, B512};
-use reth_discv4::{Discv4ConfigBuilder, NatResolver, NodeRecord};
+use reth_chainspec::ChainSpec;
+use reth_network::transactions::NetworkTransactionEvent;
+use alloy_primitives::{B256, B512};
+use reth_discv4::{Discv4ConfigBuilder, NatResolver};
 use reth_network::{
     EthNetworkPrimitives, NetworkConfigBuilder, NetworkEventListenerProvider, NetworkManager,
     PeersConfig, PeersInfo, config::SecretKey as RethSecretKey,
@@ -47,16 +48,14 @@ use tracing::{error, info, trace, warn};
 async fn main() -> Result<()> {
     let app_config = load_config()?;
     setup_logging(app_config.debug_logging);
-    info!("🚀 Starting Ethereum P2P Crawler...");
+    info!("🚀 Starting BSC P2P Mempool Crawler...");
     println!("Loaded configuration: {:?}", app_config);
 
-    let db_pool = db::create_pool(&app_config.database_url).await?;
     let (tx_broadcaster, _) = broadcast::channel::<String>(100);
     let gas_oracle = Arc::new(GasOracle::new());
 
     let app_state = Arc::new(AppState {
         tx_broadcaster: tx_broadcaster.clone(),
-        db_pool: db_pool.clone(),
         gas_oracle: gas_oracle.clone(),
     });
 
@@ -67,15 +66,13 @@ async fn main() -> Result<()> {
     let our_peer_id: PeerId = B512::from_slice(&serialized_pk_bytes[1..65]);
     info!("🔑 Our Peer ID: {}", our_peer_id);
 
-    let chain_spec: Arc<ChainSpec> = MAINNET.clone();
-    info!("⛓️ Using Chain Spec: {}", chain_spec.chain);
+    // Use BSC chain specification
+    let chain_spec: Arc<ChainSpec> = bsc_chain_spec();
+    info!("⛓️ Using Chain Spec: BSC Mainnet (Chain ID: {})", chain_spec.chain);
 
-    let bootnodes: Vec<NodeRecord> = parse_bootnodes(app_config.bootnodes.clone())?;
-    if bootnodes.is_empty() {
-        warn!("No bootnodes specified or found! Peer discovery might fail.");
-    } else {
-        info!("🌳 Using {} bootnodes", bootnodes.len());
-    }
+    // Use BSC bootnodes
+    let bootnodes = boot_nodes();
+    info!("🌳 Using {} BSC bootnodes", bootnodes.len());
 
     let tokio_handle = tokio::runtime::Handle::current();
     let task_manager = TaskManager::new(tokio_handle);
@@ -93,28 +90,34 @@ async fn main() -> Result<()> {
     let block_db_writer_tx = db_writer_tx.clone();
     let peers = Arc::new(DashMap::new());
 
+    // Configure Discv4 with BSC bootnodes
     let mut discv4_builder = Discv4ConfigBuilder::default();
     discv4_builder.add_boot_nodes(bootnodes.clone());
-    info!("🔍 Discv4 behaviour configured.");
+    discv4_builder.lookup_interval(Duration::from_millis(500)); // Faster discovery for BSC
+    info!("🔍 Discv4 behaviour configured for BSC.");
 
     let peers_config = PeersConfig::default()
         .with_max_outbound(app_config.max_peers_outbound)
         .with_max_inbound(app_config.max_peers_inbound);
 
-    let config_builder: NetworkConfigBuilder<EthNetworkPrimitives> =
-        NetworkConfigBuilder::new(secret_key)
-            .listener_addr(app_config.p2p_listen_addr)
-            .discovery_addr(app_config.discv4_listen_addr)
-            .discovery(discv4_builder)
-            .boot_nodes(bootnodes)
-            .add_nat(Some(NatResolver::Upnp))
-            .peer_config(peers_config);
+    // Build network config with BSC handshake
+    let config_builder = NetworkConfigBuilder::new(secret_key)
+        .listener_addr(app_config.p2p_listen_addr)
+        .discovery_addr(app_config.discv4_listen_addr)
+        .boot_nodes(bootnodes.clone())
+        .set_head(head())
+        .with_pow() // BSC uses PoSA, but we use with_pow for compatibility
+        .eth_rlpx_handshake(Arc::new(BscHandshake::default()))
+        .peer_config(peers_config);
 
-    let client = NoopProvider::<ChainSpec>::new(chain_spec.clone());
+    let client = NoopProvider::eth(chain_spec.clone());
     let network_config = config_builder.build(client);
 
+    // Set discovery after building
+    let network_config = network_config.set_discovery_v4(discv4_builder.build());
+
     info!(
-        "🔧 Network configured. RLPx TCP listening on {}. Discovery UDP listening on {}. Attempting UPnP NAT.",
+        "🔧 Network configured. RLPx TCP listening on {}. Discovery UDP listening on {}.",
         app_config.p2p_listen_addr, app_config.discv4_listen_addr
     );
 
@@ -128,7 +131,7 @@ async fn main() -> Result<()> {
 
     let mut events = network_handle.event_listener();
 
-    let initial_head = Head::default();
+    let initial_head = head();
     let event_handler = EthP2PHandler::new(
         chain_spec.clone(),
         network_handle.clone(),
@@ -196,10 +199,9 @@ async fn main() -> Result<()> {
     info!("Spawned Decoded Transaction Processor task.");
 
     let writer_ui_tx = ui_tx.clone();
-    let db_pool_clone = db_pool.clone();
     let broadcaster = tx_broadcaster.clone();
     task_executor.spawn(Box::pin(async move {
-        info!(target: "crawler::db-writer", "Starting database writer task...");
+        info!(target: "crawler::tx-writer", "Starting transaction writer task...");
         while let Some(tx) = db_writer_rx.recv().await {
             let api_tx = ApiTransaction {
                 hash: tx.hash.to_string(),
@@ -215,35 +217,6 @@ async fn main() -> Result<()> {
                 is_private: tx.is_private,
             };
 
-            let query_result = sqlx::query!(
-                r#"
-                INSERT INTO transactions (
-                    hash, tx_type, sender, receiver, value_wei, gas_limit, 
-                    gas_price_or_max_fee_wei, max_priority_fee_wei, input_len, 
-                    first_seen_at, is_private
-                )
-                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
-                ON CONFLICT (hash) DO NOTHING
-                "#,
-                api_tx.hash,
-                api_tx.tx_type,
-                api_tx.sender,
-                api_tx.receiver,
-                api_tx.value_wei,
-                api_tx.gas_limit,
-                api_tx.gas_price_or_max_fee_wei,
-                api_tx.max_priority_fee_wei,
-                api_tx.input_len,
-                api_tx.first_seen_at,
-                api_tx.is_private
-            )
-            .execute(&db_pool_clone)
-            .await;
-
-            if let Err(e) = query_result {
-                warn!(target: "crawler::db-writer", "Failed to write tx {} to DB: {}", api_tx.hash, e);
-            }
-
             if let Ok(tx_json) = serde_json::to_string(&api_tx) {
                 if broadcaster.send(tx_json).is_err() {
                     trace!(target: "crawler::broadcaster", "No active WebSocket clients to broadcast to");
@@ -251,11 +224,11 @@ async fn main() -> Result<()> {
             }
 
             if writer_ui_tx.send(UiUpdate::NewTx(Box::new(tx))).is_err() {
-                error!(target: "crawler::db-writer", "Failed to send tx update to UI: receiver dropped.");
+                error!(target: "crawler::tx-writer", "Failed to send tx update to UI: receiver dropped.");
             }
         }
     }));
-    info!("Spawned Database Writer task.");
+    info!("Spawned Transaction Writer task.");
 
     let network_manager_handle = task_executor.spawn(Box::pin(async move {
         info!(target: "crawler::netmgr", "Starting core network task...");
@@ -342,7 +315,6 @@ async fn main() -> Result<()> {
 
     tokio::time::sleep(std::time::Duration::from_millis(150)).await;
 
-    drop(db_pool);
     drop(task_manager);
 
     let _ = tokio::join!(ui_task_handle, network_manager_handle);

@@ -2,7 +2,7 @@ use crate::oracle::GasOracle;
 use axum::{
     Json, Router,
     extract::{
-        Path, State,
+        State,
         ws::{Message, WebSocket, WebSocketUpgrade},
     },
     http::StatusCode,
@@ -11,7 +11,6 @@ use axum::{
 };
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use sqlx::PgPool;
 use std::sync::Arc;
 use tokio::sync::broadcast;
 use tracing::{info, warn};
@@ -19,11 +18,10 @@ use tracing::{info, warn};
 #[derive(Clone)]
 pub struct AppState {
     pub tx_broadcaster: broadcast::Sender<String>,
-    pub db_pool: PgPool,
     pub gas_oracle: Arc<GasOracle>,
 }
 
-#[derive(Deserialize, Serialize, sqlx::FromRow)]
+#[derive(Deserialize, Serialize)]
 pub struct ApiTransaction {
     pub hash: String,
     pub tx_type: i16,
@@ -65,53 +63,6 @@ async fn websocket(mut socket: WebSocket, state: Arc<AppState>) {
     }
 }
 
-/// Handler to get a single transaction by its hash.
-async fn get_transaction_by_hash(
-    State(state): State<Arc<AppState>>,
-    Path(hash): Path<String>,
-) -> impl IntoResponse {
-    let query = "SELECT * FROM transactions WHERE hash = $1";
-    match sqlx::query_as::<_, ApiTransaction>(query)
-        .bind(&hash)
-        .fetch_one(&state.db_pool)
-        .await
-    {
-        Ok(tx) => (StatusCode::OK, Json(tx)).into_response(),
-        Err(sqlx::Error::RowNotFound) => (
-            StatusCode::NOT_FOUND,
-            format!("Transaction not found: {}", hash),
-        )
-            .into_response(),
-        Err(e) => {
-            warn!(target: "crawler::api", "Database error fetching tx {}: {}", hash, e);
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "Database error".to_string(),
-            )
-                .into_response()
-        }
-    }
-}
-
-/// Handler to get the 10 most recently seen transactions.
-async fn get_latest_transactions(State(state): State<Arc<AppState>>) -> impl IntoResponse {
-    let query = "SELECT * FROM transactions ORDER BY first_seen_at DESC LIMIT 10";
-    match sqlx::query_as::<_, ApiTransaction>(query)
-        .fetch_all(&state.db_pool)
-        .await
-    {
-        Ok(txs) => (StatusCode::OK, Json(txs)).into_response(),
-        Err(e) => {
-            warn!(target: "crawler::api", "Database error fetching latest txs: {}", e);
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "Database error".to_string(),
-            )
-                .into_response()
-        }
-    }
-}
-
 /// Get gas prices
 async fn get_gas_oracle(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     let estimates = state.gas_oracle.get_estimates().await;
@@ -123,7 +74,5 @@ pub fn create_router(app_state: Arc<AppState>) -> Router {
     Router::new()
         .route("/ws", get(websocket_handler))
         .route("/api/gas/oracle", get(get_gas_oracle))
-        .route("/tx/:hash", get(get_transaction_by_hash))
-        .route("/txs/latest", get(get_latest_transactions))
         .with_state(app_state)
 }

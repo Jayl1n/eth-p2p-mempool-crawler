@@ -1,4 +1,5 @@
 use anyhow::Result;
+use alloy_primitives::U256;
 use crossterm::{
     event::{self, DisableMouseCapture, EnableMouseCapture, Event as CrosstermEvent, KeyCode},
     execute,
@@ -13,7 +14,6 @@ use ratatui::{
     text::{Line, Span},
     widgets::{Block, Borders, Cell, List, ListItem, Paragraph, Row, Table, TableState},
 };
-use reth::revm::revm::primitives::U256;
 use reth_primitives::TxType;
 use std::{
     collections::VecDeque,

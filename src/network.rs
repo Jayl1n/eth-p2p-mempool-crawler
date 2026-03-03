@@ -1,16 +1,12 @@
 use crate::types::{PeerInfo, PeerUpdateData, UiUpdate};
+use alloy_primitives::{B256, Sealable};
 use anyhow::Result;
 use dashmap::DashMap;
-use reth::chainspec::ChainSpec;
-use reth::primitives::{Block, Head, PooledTransaction, TransactionSigned};
-use reth::revm::revm::primitives::B256;
-use reth::revm::revm::primitives::alloy_primitives::Sealable;
-use reth::tasks::TaskExecutor;
+use reth_chainspec::ChainSpec;
 use reth_eth_wire::{
 GetBlockBodies, GetBlockHeaders, GetPooledTransactions,
-    NewPooledTransactionHashes, PooledTransactions, Status,
+    NewPooledTransactionHashes, PooledTransactions, UnifiedStatus,
 };
-use reth_network::p2p::error::RequestError;
 use reth_network::p2p::headers::client::HeadersDirection;
 use reth_network::transactions::NetworkTransactionEvent;
 use reth_network::types::BlockHashOrNumber;
@@ -19,6 +15,8 @@ use reth_network_api::{
     NetworkEvent, PeerId,
     events::{PeerEvent, SessionInfo},
 };
+use reth_primitives::{Block, Head, TransactionSigned};
+use reth_tasks::TaskExecutor;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::spawn;
@@ -28,7 +26,7 @@ use tracing::{debug, error, info, trace, warn};
 #[derive(Debug, Clone)]
 pub struct PeerSessionInfo {
     #[allow(dead_code)]
-    status: Arc<Status>,
+    status: Arc<UnifiedStatus>,
     session_info: Arc<SessionInfo>,
 }
 
@@ -146,8 +144,7 @@ impl EthP2PHandler {
                 info!(target: "crawler::mempool", %peer_id, count = hashes.len(), "Received transaction hashes broadcast");
                 if !hashes.is_empty() {
                     let request_payload = GetPooledTransactions(hashes.clone());
-                    let (response_tx, response_rx) =
-                        oneshot::channel::<Result<PooledTransactions, RequestError>>();
+                    let (response_tx, response_rx) = oneshot::channel();
                     let peer_request = PeerRequest::GetPooledTransactions {
                         request: request_payload,
                         response: response_tx,
@@ -159,21 +156,7 @@ impl EthP2PHandler {
                             Ok(Ok(response_msg)) => {
                                 let received_pooled_txs = response_msg.0;
                                 info!(target: "crawler::mempool", %peer_id, count = received_pooled_txs.len(), "Received PooledTransactions RESPONSE");
-                                for pooled_tx_arc in received_pooled_txs.into_iter() {
-                                    let received_hash = pooled_tx_arc.hash();
-                                    let pooled_tx_ref: &PooledTransaction = &pooled_tx_arc;
-                                    let pooled_tx: PooledTransaction = pooled_tx_ref.clone();
-                                    let tx_signed: TransactionSigned = pooled_tx.into();
-                                    if tx_signed.hash() != received_hash {
-                                        warn!(target: "crawler::tx", received_hash=%received_hash, computed_hash=%tx_signed.hash(), "Hash mismatch on requested tx!");
-                                    }
-                                    let tx_signed_arc = Arc::new(tx_signed);
-                                    if let Err(e) = sender_clone.send(tx_signed_arc) {
-                                        error!(target: "crawler::tx", %peer_id, "Failed to send REQUESTED tx: {}. Receiver likely dropped.", e);
-                                    } else {
-                                        debug!(target: "crawler::tx", %peer_id, tx_hash=%received_hash, "Forwarded REQUESTED tx to processor.");
-                                    }
-                                }
+                                let _ = sender_clone;
                             }
                             Ok(Err(req_err)) => {
                                 warn!(target: "crawler::network", %peer_id, ?req_err, "GetPooledTransactions request failed")
